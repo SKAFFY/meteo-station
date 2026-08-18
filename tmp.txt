@@ -1,0 +1,295 @@
+package main
+
+import (
+	"machine"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/antonfisher/scd30"
+	"tinygo.org/x/drivers/ens160"
+	"tinygo.org/x/drivers/gps"
+)
+
+// ============================================================
+//  КОНФИГУРАЦИЯ
+// ============================================================
+
+const (
+	i2cSDA = machine.GP0
+	i2cSCL = machine.GP1
+
+	gpsTX = machine.GP4
+	gpsRX = machine.GP5
+
+	sensorPollInterval = 2 * time.Second
+	filterBufferSize   = 5
+	timezoneOffset     = 3
+)
+
+// ============================================================
+//  КОЛЬЦЕВОЙ БУФЕР ДЛЯ УСРЕДНЕНИЯ
+// ============================================================
+
+type RingBuffer struct {
+	vals  [filterBufferSize]float32
+	idx   int
+	count int
+}
+
+func (rb *RingBuffer) Push(v float32) {
+	rb.vals[rb.idx] = v
+	rb.idx = (rb.idx + 1) % filterBufferSize
+	if rb.count < filterBufferSize {
+		rb.count++
+	}
+}
+
+func (rb *RingBuffer) Average() float32 {
+	if rb.count == 0 {
+		return 0
+	}
+	sum := float32(0)
+	for i := 0; i < rb.count; i++ {
+		sum += rb.vals[i]
+	}
+	return sum / float32(rb.count)
+}
+
+// ============================================================
+//  ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (ДАТЧИКИ И ДАННЫЕ)
+// ============================================================
+
+var (
+	bufCO2  RingBuffer
+	bufTemp RingBuffer
+	bufHum  RingBuffer
+	bufECO2 RingBuffer
+	bufVOC  RingBuffer
+
+	lastLat    float64
+	lastLng    float64
+	lastUTC    string
+	lastLocal  string
+	gpsValid   bool
+	hadFixOnce bool
+
+	// Исправленные типы:
+	scd    scd30.Device // вместо SCD30
+	ens    *ens160.Device
+	gpsDev gps.Device // значение, не указатель
+)
+
+// ============================================================
+//  ОСНОВНАЯ ФУНКЦИЯ
+// ============================================================
+
+func main() {
+	println("=== Air Quality Monitor (no display) ===")
+
+	// ---- I2C ----
+	i2c := machine.I2C0
+	err := i2c.Configure(machine.I2CConfig{
+		Frequency: machine.TWI_FREQ_400KHZ,
+		SDA:       i2cSDA,
+		SCL:       i2cSCL,
+	})
+	if err != nil {
+		println("I2C error:", err.Error())
+		return
+	}
+	println("I2C OK")
+
+	// ---- SCD30 ----
+	scd = scd30.New(i2c)
+	ver, err := scd.GetSoftwareVersion()
+	if err != nil {
+		println("SCD30 error:", err.Error())
+	} else {
+		println("SCD30 fw:", ver)
+	}
+	err = scd.StartContinuousMeasurement(0)
+	if err != nil {
+		println("SCD30 start error:", err.Error())
+	} else {
+		println("SCD30 started")
+	}
+
+	// ---- ENS160 ----
+	ens = ens160.New(i2c, 0x53)
+	if !ens.Connected() {
+		println("ENS160 not connected")
+	} else {
+		println("ENS160 connected")
+	}
+
+	// ---- GPS ----
+	uart := machine.UART0
+	err = uart.Configure(machine.UARTConfig{
+		BaudRate: 9600,
+		TX:       gpsTX,
+		RX:       gpsRX,
+	})
+	if err != nil {
+		println("UART error:", err.Error())
+	}
+	gpsDev = gps.NewUART(uart) // теперь присваиваем значение
+	println("GPS initialized")
+
+	// ---- Основной цикл ----
+	lastPoll := time.Now()
+	lastPrint := time.Now()
+
+	for {
+		now := time.Now()
+
+		if now.Sub(lastPoll) >= sensorPollInterval {
+			readSensors()
+			lastPoll = now
+		}
+
+		readGPS()
+
+		if now.Sub(lastPrint) >= 5*time.Second {
+			printData()
+			lastPrint = now
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// ============================================================
+//  ЧТЕНИЕ ДАТЧИКОВ
+// ============================================================
+
+func readSensors() {
+	// SCD30
+	ready, err := scd.HasDataReady()
+	if err != nil {
+		println("SCD30 ready error:", err.Error())
+	} else if ready {
+		meas, err := scd.ReadMeasurement()
+		if err != nil {
+			println("SCD30 read error:", err.Error())
+		} else {
+			bufCO2.Push(meas.CO2)
+			bufTemp.Push(meas.Temperature)
+			bufHum.Push(meas.Humidity)
+		}
+	}
+
+	// ENS160
+	status := ens.Validity()
+	if status == ens160.ValidityNormalOperation {
+		eco2 := ens.ECO2()
+		tvoc := ens.TVOC()
+		bufECO2.Push(float32(eco2))
+		bufVOC.Push(float32(tvoc))
+	}
+}
+
+// ============================================================
+//  ЧТЕНИЕ GPS (с парсингом NMEA)
+// ============================================================
+
+func readGPS() {
+	for {
+		sentence, err := gpsDev.NextSentence() // используем значение
+		if err != nil {
+			break
+		}
+		parseNMEA(sentence)
+	}
+}
+
+func parseNMEA(s string) {
+	if !strings.HasPrefix(s, "$GPRMC") {
+		return
+	}
+	fields := strings.Split(s, ",")
+	if len(fields) < 10 {
+		return
+	}
+	utcStr := fields[1]
+	if len(utcStr) >= 6 {
+		lastUTC = utcStr[0:2] + ":" + utcStr[2:4] + ":" + utcStr[4:6]
+	}
+	if fields[2] != "A" {
+		gpsValid = false
+		return
+	}
+	gpsValid = true
+	hadFixOnce = true
+
+	if lat, err := strconv.ParseFloat(fields[3], 64); err == nil {
+		lastLat = lat / 100.0
+		if fields[4] == "S" {
+			lastLat = -lastLat
+		}
+	}
+	if lon, err := strconv.ParseFloat(fields[5], 64); err == nil {
+		lastLng = lon / 100.0
+		if fields[6] == "W" {
+			lastLng = -lastLng
+		}
+	}
+	if len(utcStr) >= 6 {
+		h, _ := strconv.Atoi(utcStr[0:2])
+		h = (h + timezoneOffset) % 24
+		lastLocal = strconv.Itoa(h) + ":" + utcStr[2:4] + ":" + utcStr[4:6]
+	}
+}
+
+// ============================================================
+//  ВЫВОД ДАННЫХ В UART
+// ============================================================
+
+func printData() {
+	avgCO2 := bufCO2.Average()
+	avgTemp := bufTemp.Average()
+	avgHum := bufHum.Average()
+	avgECO2 := bufECO2.Average()
+	avgVOC := bufVOC.Average()
+
+	println("===== DATA =====")
+	println("CO2:", fmtFloat(avgCO2), "ppm")
+	println("eCO2:", fmtFloat(avgECO2), "ppm")
+	println("VOC:", fmtFloat(avgVOC), "ppb")
+	println("Temp:", fmtFloat(avgTemp), "°C")
+	println("Hum:", fmtFloat(avgHum), "%")
+
+	if gpsValid {
+		println("UTC:", lastUTC)
+		println("Local:", lastLocal)
+		println("Lat:", fmtFloat64(lastLat))
+		println("Lng:", fmtFloat64(lastLng))
+	} else if hadFixOnce {
+		println("! LOST SATELLITE !")
+		println("Last UTC:", lastUTC, "(old)")
+		println("Last Lat:", fmtFloat64(lastLat), "(old)")
+		println("Last Lng:", fmtFloat64(lastLng), "(old)")
+		println("Waiting for satellite...")
+	} else {
+		println("Waiting for satellite...")
+	}
+	println("================\n")
+}
+
+// ============================================================
+//  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ФОРМАТИРОВАНИЯ
+// ============================================================
+
+func fmtFloat(v float32) string {
+	if v == 0 {
+		return "---"
+	}
+	return strconv.FormatFloat(float64(v), 'f', 1, 32)
+}
+
+func fmtFloat64(v float64) string {
+	if v == 0 {
+		return "---"
+	}
+	return strconv.FormatFloat(v, 'f', 6, 64)
+}
