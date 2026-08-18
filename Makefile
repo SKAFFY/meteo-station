@@ -3,7 +3,7 @@
 
 TARGET ?= pico2
 PORT ?= /dev/ttyACM0
-MAIN ?= main.go
+MAIN ?= cmd/main.go
 BUILD_DIR ?= build
 
 .PHONY: build flash clean monitor size
