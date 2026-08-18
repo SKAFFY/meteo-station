@@ -27,6 +27,9 @@ const (
 	epdDC   = machine.GP13
 	epdRST  = machine.GP14
 	epdBUSY = machine.GP15
+	// SDI (MISO) SPI1 — не используется дисплеем, но обязателен для validPins
+	// на RP2350. Никуда физически не подключается.
+	epdMISO = machine.GP8
 
 	// тайминги
 	pollInterval = 2 * time.Second
@@ -65,6 +68,7 @@ func main() {
 		Frequency: 4_000_000,
 		SCK:       epdSCLK,
 		SDO:       epdMOSI,
+		SDI:       epdMISO,
 	}); err != nil {
 		failBlink(err)
 	}
