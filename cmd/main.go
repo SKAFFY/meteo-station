@@ -45,7 +45,7 @@ func main() {
 		SDA:       i2cSDA,
 		SCL:       i2cSCL,
 	}); err != nil {
-		failBlink()
+		failBlink(err)
 	}
 
 	sens := sensors.New(machine.I2C0)
@@ -57,7 +57,7 @@ func main() {
 		TX:       gpsTX,
 		RX:       gpsRX,
 	}); err != nil {
-		failBlink()
+		failBlink(err)
 	}
 	tracker := gpsfix.New(machine.UART1, tzOffset)
 
@@ -66,7 +66,7 @@ func main() {
 		SCK:       epdSCLK,
 		SDO:       epdMOSI,
 	}); err != nil {
-		failBlink()
+		failBlink(err)
 	}
 	disp := ui.New(machine.SPI1, epdCS, epdDC, epdRST, epdBUSY)
 	disp.Init()
@@ -184,10 +184,11 @@ func toInt(f float32) int {
 }
 
 // failBlink мигает встроенным светодиодом при фатальной ошибке инициализации.
-func failBlink() {
+func failBlink(err error) {
 	led := machine.LED
 	led.Configure(machine.PinConfig{Mode: machine.PinOutput})
 	for {
+		println(err.Error())
 		led.High()
 		time.Sleep(200 * time.Millisecond)
 		led.Low()
