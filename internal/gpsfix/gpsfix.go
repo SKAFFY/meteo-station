@@ -6,11 +6,11 @@ import (
 	"tinygo.org/x/drivers/gps"
 )
 
-// byteSource — узкий источник байтов UART, реализуемый machine.UART.
-// Выделен отдельно, чтобы трекер можно было тестировать без железа.
-type byteSource interface {
-	Buffered() int
-	ReadByte() (byte, error)
+// sentenceSource — источник готовых NMEA-предложений.
+// Реализуется *gps.Device через NextSentence. Выделен, чтобы трекер
+// можно было тестировать без железа.
+type sentenceSource interface {
+	NextSentence() (string, error)
 }
 
 // Fix содержит последние известные координаты, время и статус фикса.
@@ -22,70 +22,54 @@ type Fix struct {
 	Satellites int16
 }
 
-// Tracker читает NMEA с UART неблокирующим способом, парсит предложения
-// драйвером gps и хранит последний валидный фикс вместе с флагом валидности.
+// Tracker читает NMEA-предложения через готовый драйвер gps.Device (блокирующе,
+// в фоновой горутине), парсит их готовым gps.Parser и хранит последний валидный
+// фикс вместе с флагом валидности.
 type Tracker struct {
-	uart      byteSource
+	dev       sentenceSource
 	parser    gps.Parser
-	line      []byte
 	last      Fix
 	valid     bool
 	everFixed bool
 	tzOffset  time.Duration
 }
 
-// New создаёт трекер, читающий с уже сконфигурированного UART.
+// New создаёт трекер на основе сконфигурированного GPS-устройства.
 // tzOffset задаёт сдвиг для локального времени (например, 3*time.Hour).
-func New(uart byteSource, tzOffset time.Duration) *Tracker {
-	return &Tracker{uart: uart, tzOffset: tzOffset}
+func New(dev sentenceSource, tzOffset time.Duration) *Tracker {
+	return &Tracker{dev: dev, tzOffset: tzOffset}
 }
 
-// Update потребляет накопленные байты UART, собирает NMEA-строки и парсит их.
-// Возвращает true, если статус валидности фикса изменился (полезно для пропуска
-// перерисовки экрана).
-func (t *Tracker) Update() bool {
-	prev := t.valid
-	current := false
+// Start запускает фоновую горутину чтения и парсинга GPS.
+func (t *Tracker) Start() {
+	go t.run()
+}
 
-	var b byte
-	for t.uart.Buffered() > 0 {
-		b, _ = t.uart.ReadByte()
-		if b == '\n' {
-			if len(t.line) > 0 && t.consume(t.line) {
-				current = true
-			}
-			t.line = t.line[:0]
+// run блокирующе читает предложения с устройства и обновляет состояние фикса.
+func (t *Tracker) run() {
+	for {
+		sentence, err := t.dev.NextSentence()
+		if err != nil {
 			continue
 		}
-		t.line = append(t.line, b)
+		fix, err := t.parser.Parse(sentence)
+		if err != nil {
+			continue
+		}
+		if fix.Valid {
+			t.everFixed = true
+			t.last = Fix{
+				Time:       fix.Time,
+				Latitude:   fix.Latitude,
+				Longitude:  fix.Longitude,
+				Altitude:   fix.Altitude,
+				Satellites: fix.Satellites,
+			}
+			t.valid = true
+		} else {
+			t.valid = false
+		}
 	}
-
-	t.valid = current
-	return t.valid != prev
-}
-
-// consume парсит одну NMEA-строку и возвращает true, если получен валидный фикс.
-func (t *Tracker) consume(line []byte) bool {
-	// NMEA-строки оканчиваются на \r\n — убираем хвостовой \r.
-	for len(line) > 0 && line[len(line)-1] == '\r' {
-		line = line[:len(line)-1]
-	}
-	fix, err := t.parser.Parse(string(line))
-	if err != nil {
-		return false
-	}
-	if !fix.Valid {
-		return false
-	}
-	t.everFixed = true
-	t.last = Fix{
-		Time:       fix.Time,
-		Latitude:   fix.Latitude,
-		Longitude:  fix.Longitude,
-		Altitude:   fix.Altitude,
-		Satellites: fix.Satellites,
-	}
-	return true
 }
 
 // Fix возвращает последний известный фикс.

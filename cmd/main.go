@@ -9,6 +9,7 @@ import (
 	"github.com/SKAFFY/meteo-station/internal/ring"
 	"github.com/SKAFFY/meteo-station/internal/sensors"
 	"github.com/SKAFFY/meteo-station/internal/ui"
+	"tinygo.org/x/drivers/gps"
 )
 
 const (
@@ -62,7 +63,9 @@ func main() {
 	}); err != nil {
 		failBlink(err)
 	}
-	tracker := gpsfix.New(machine.UART1, tzOffset)
+	gpsDevice := gps.NewUART(machine.UART1)
+	tracker := gpsfix.New(&gpsDevice, tzOffset)
+	tracker.Start()
 
 	if err := machine.SPI1.Configure(machine.SPIConfig{
 		Frequency: 4_000_000,
@@ -115,8 +118,6 @@ func main() {
 				eco2.Add(r.Eco2)
 				tvoc.Add(r.TVOC)
 			}
-
-			tracker.Update()
 		}
 
 		if now.Sub(lastDraw) >= drawInterval {

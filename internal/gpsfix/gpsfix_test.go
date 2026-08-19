@@ -6,34 +6,47 @@ import (
 	"time"
 )
 
-// mockSrc эмулирует UART-источник байтов без железа.
+// mockSrc эмулирует источник NMEA-предложений через канал.
+// NextSentence блокирует, ожидая новое предложение (как драйвер gps.Device).
 type mockSrc struct {
-	data []byte
+	in chan string
 }
 
-func (m *mockSrc) Buffered() int { return len(m.data) }
+func newMock() *mockSrc {
+	return &mockSrc{in: make(chan string)}
+}
 
-func (m *mockSrc) ReadByte() (byte, error) {
-	if len(m.data) == 0 {
-		return 0, io.EOF
+func (m *mockSrc) NextSentence() (string, error) {
+	s, ok := <-m.in
+	if !ok {
+		return "", io.EOF
 	}
-	b := m.data[0]
-	m.data = m.data[1:]
-	return b, nil
+	return s, nil
 }
 
-const validRMC = "$GPRMC,203522.00,A,5109.0262308,N,11401.8407342,W,0.004,133.4,010622,0.0,E,D*2B\r\n"
+const validRMC = "$GPRMC,203522.00,A,5109.0262308,N,11401.8407342,W,0.004,133.4,010622,0.0,E,D*2B"
+const voidRMC = "$GPRMC,203600.00,V,5109.0262308,N,11401.8407342,W,0.004,133.4,010622,0.0,E,A*2B"
+
+// waitFor ждёт, пока cond вернёт true, с тайм-аутом (чтение идёт в горутине).
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("таймаут ожидания условия")
+}
 
 func TestValidFix(t *testing.T) {
-	m := &mockSrc{data: []byte(validRMC)}
+	m := newMock()
 	tr := New(m, 3*time.Hour)
+	tr.Start()
+	m.in <- validRMC
 
-	if changed := tr.Update(); !changed {
-		t.Fatal("ожидалось изменение статуса валидности")
-	}
-	if !tr.Valid() {
-		t.Fatal("ожидался валидный фикс")
-	}
+	waitFor(t, tr.Valid)
 	if !tr.EverFixed() {
 		t.Fatal("ожидался флаг EverFixed")
 	}
@@ -55,9 +68,12 @@ func TestValidFix(t *testing.T) {
 }
 
 func TestNoDataNotValid(t *testing.T) {
-	m := &mockSrc{}
+	m := newMock()
 	tr := New(m, 3*time.Hour)
-	tr.Update()
+	tr.Start()
+
+	// Ни одного предложения — фикс не появляется.
+	time.Sleep(50 * time.Millisecond)
 	if tr.Valid() {
 		t.Fatal("без данных фикс не должен быть валидным")
 	}
@@ -67,17 +83,17 @@ func TestNoDataNotValid(t *testing.T) {
 }
 
 func TestLossKeepsLastFix(t *testing.T) {
-	m := &mockSrc{data: []byte(validRMC)}
+	m := newMock()
 	tr := New(m, 3*time.Hour)
-	tr.Update()
+	tr.Start()
+	m.in <- validRMC
+
+	waitFor(t, tr.Valid)
 
 	// Потеря сигнала: RMC со статусом V (void).
-	m.data = append(m.data, []byte("$GPRMC,203600.00,V,5109.0262308,N,11401.8407342,W,0.004,133.4,010622,0.0,E,D*??\r\n")...)
-	tr.Update()
+	m.in <- voidRMC
+	waitFor(t, func() bool { return !tr.Valid() })
 
-	if tr.Valid() {
-		t.Fatal("после потери сигнала фикс не должен быть валидным")
-	}
 	if !tr.EverFixed() {
 		t.Fatal("флаг EverFixed должен сохраниться")
 	}
