@@ -1,9 +1,0 @@
-{
-    "go.buildTags": "cortexm,baremetal,linux,arm,rp2350,rp,pico2",
-    "go.toolsEnvVars": {
-        "GOOS": "linux",
-        "GOARCH": "arm"
-    },
-    "tinygo.target": "pico2",
-    "go.goroot": "/Users/mkheyfets/Library/Caches/tinygo/goroot-117665449d30e705862af4f4b9fd82f02e2821bf626daea90cb1a24977435be4"
-}
