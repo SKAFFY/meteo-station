@@ -13,23 +13,14 @@ type sentenceSource interface {
 	NextSentence() (string, error)
 }
 
-// Fix содержит последние известные координаты, время и статус фикса.
-type Fix struct {
-	Time       time.Time
-	Latitude   float32
-	Longitude  float32
-	Altitude   int32
-	Satellites int16
-}
-
 // Tracker читает NMEA-предложения через готовый драйвер gps.Device (блокирующе,
 // в фоновой горутине), парсит их готовым gps.Parser и хранит последний валидный
-// фикс вместе с флагом валидности.
+// фикс вместе с флагом актуальности.
 type Tracker struct {
 	dev       sentenceSource
 	parser    gps.Parser
-	last      Fix
-	valid     bool
+	lastValid gps.Fix
+	hasFix    bool
 	everFixed bool
 	tzOffset  time.Duration
 }
@@ -58,28 +49,22 @@ func (t *Tracker) run() {
 		}
 		if fix.Valid {
 			t.everFixed = true
-			t.last = Fix{
-				Time:       fix.Time,
-				Latitude:   fix.Latitude,
-				Longitude:  fix.Longitude,
-				Altitude:   fix.Altitude,
-				Satellites: fix.Satellites,
-			}
-			t.valid = true
+			t.lastValid = fix
+			t.hasFix = true
 		} else {
-			t.valid = false
+			t.hasFix = false
 		}
 	}
 }
 
-// Fix возвращает последний известный фикс.
-func (t *Tracker) Fix() Fix {
-	return t.last
+// Fix возвращает последний известный валидный фикс (сохраняется и при потере сигнала).
+func (t *Tracker) Fix() gps.Fix {
+	return t.lastValid
 }
 
 // Valid сообщает, есть ли на текущий момент валидный фикс.
 func (t *Tracker) Valid() bool {
-	return t.valid
+	return t.hasFix
 }
 
 // EverFixed сообщает, был ли получен хотя бы один валидный фикс с момента старта.
@@ -89,5 +74,5 @@ func (t *Tracker) EverFixed() bool {
 
 // LocalTime возвращает локальное время (UTC + заданный сдвиг).
 func (t *Tracker) LocalTime() time.Time {
-	return t.last.Time.Add(t.tzOffset)
+	return t.lastValid.Time.Add(t.tzOffset)
 }
